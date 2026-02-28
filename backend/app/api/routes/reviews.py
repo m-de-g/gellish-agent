@@ -24,6 +24,7 @@ class ReviewItemOut(BaseModel):
     notes: str | None
     dismissed_reason: str | None
     created_at: Any
+    updated_at: Any
     resolved_at: Any | None
     dismissed_at: Any | None
 
@@ -61,6 +62,7 @@ def list_reviews(
             notes=row.notes,
             dismissed_reason=row.dismissed_reason,
             created_at=row.created_at,
+            updated_at=row.updated_at,
             resolved_at=row.resolved_at,
             dismissed_at=row.dismissed_at,
         )
@@ -84,6 +86,7 @@ def resolve_review(
     row.dismissed_reason = None
     row.dismissed_at = None
     row.resolved_at = datetime.now(timezone.utc)
+    row.updated_at = row.resolved_at
     db.commit()
 
     return ReviewItemOut(
@@ -96,6 +99,7 @@ def resolve_review(
         notes=row.notes,
         dismissed_reason=row.dismissed_reason,
         created_at=row.created_at,
+        updated_at=row.updated_at,
         resolved_at=row.resolved_at,
         dismissed_at=row.dismissed_at,
     )
@@ -116,6 +120,7 @@ def dismiss_review(
     row.resolution = None
     row.resolved_at = None
     row.dismissed_at = datetime.now(timezone.utc)
+    row.updated_at = row.dismissed_at
     db.commit()
 
     return ReviewItemOut(
@@ -128,6 +133,7 @@ def dismiss_review(
         notes=row.notes,
         dismissed_reason=row.dismissed_reason,
         created_at=row.created_at,
+        updated_at=row.updated_at,
         resolved_at=row.resolved_at,
         dismissed_at=row.dismissed_at,
     )

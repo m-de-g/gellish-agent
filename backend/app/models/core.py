@@ -162,17 +162,15 @@ class ReviewQueue(Base):
     dismissed_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     resolved_at: Mapped[str | None] = mapped_column(DateTime(timezone=True), nullable=True)
     dismissed_at: Mapped[str | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[str] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     created_at: Mapped[str] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class ConceptUidMapping(Base):
-    __tablename__ = "concept_uid_mapping"
+class ConceptAlias(Base):
+    __tablename__ = "concept_alias"
     id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
-    old_uid: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    old_uid: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     new_uid: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    mapping_type: Mapped[str] = mapped_column(String(32), nullable=False, default="promotion")
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="concept")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    __table_args__ = (
-        Index("ux_concept_uid_mapping_old_new", "old_uid", "new_uid", unique=True),
-    )
