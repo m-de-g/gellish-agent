@@ -10,9 +10,12 @@ dependencies = [
   "alembic",
   "psycopg2-binary",
   "python-dotenv",
+  "python-multipart",
   "pydantic>=2.0",
   "pydantic-settings",
   "pytest",
+  "trafilatura",
+  "beautifulsoup4",
 ]
 
 [tool.ruff]

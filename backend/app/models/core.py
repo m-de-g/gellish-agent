@@ -1,16 +1,29 @@
 from __future__ import annotations
 
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Index, JSON, String, Text
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from ..db.session import Base
 
+PK_TYPE = BigInteger().with_variant(Integer, "sqlite")
+
+
 class Document(Base):
     __tablename__ = "document"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
     source: Mapped[str | None] = mapped_column(Text, nullable=True)  # filename or URL
     mime_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -19,7 +32,7 @@ class Document(Base):
 
 class Sentence(Base):
     __tablename__ = "sentence"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
     document_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("document.id", ondelete="CASCADE"), index=True)
     sentence_index: Mapped[int] = mapped_column(BigInteger, nullable=False)  # order within doc
     text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -41,7 +54,7 @@ class Concept(Base):
 
 class Term(Base):
     __tablename__ = "term"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
     concept_uid: Mapped[str] = mapped_column(String(255), ForeignKey("concept.uid", ondelete="CASCADE"), index=True)
     lang: Mapped[str] = mapped_column(String(16), nullable=False, default="en")
     label: Mapped[str] = mapped_column(Text, nullable=False)
@@ -63,7 +76,7 @@ class RelationType(Base):
 
 class TranslationRun(Base):
     __tablename__ = "translation_run"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
     document_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("document.id", ondelete="CASCADE"), index=True)
     tool_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     llm_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -73,7 +86,7 @@ class TranslationRun(Base):
 
 class Expression(Base):
     __tablename__ = "expression"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
     subject_uid: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     relation_uid: Mapped[str] = mapped_column(String(255), ForeignKey("relation_type.uid"), nullable=False, index=True)
     object_uid: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)  # concept UID
@@ -86,7 +99,7 @@ class Expression(Base):
 
 class AdvisorCall(Base):
     __tablename__ = "advisor_call"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
     translation_run_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("translation_run.id", ondelete="CASCADE"), index=True)
     request_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     response_json: Mapped[dict] = mapped_column(JSON, nullable=False)
@@ -95,7 +108,7 @@ class AdvisorCall(Base):
 
 class ReviewQueue(Base):
     __tablename__ = "review_queue"
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
     item_type: Mapped[str] = mapped_column(String(64), nullable=False)  # concept|relation|expression
     item_ref: Mapped[str] = mapped_column(Text, nullable=False)         # UID or expression id, etc.
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
