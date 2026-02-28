@@ -1,0 +1,37 @@
+relations:
+  - uid: "rel:has_value"
+    pref_label: "has value"
+    definition: "Assigns a literal value to a subject"
+    status: "active"
+
+  - uid: "rel:is_a"
+    pref_label: "is a"
+    definition: "Classification / subtype relation"
+    status: "active"
+
+  - uid: "rel:has_part"
+    pref_label: "has part"
+    definition: "Whole has component part"
+    status: "active"
+
+  - uid: "rel:located_in"
+    pref_label: "is located in"
+    definition: "Location containment"
+    status: "active"
+
+concepts:
+  - uid: "concept:thing"
+    pref_label: "thing"
+    definition: "Any entity"
+    status: "active"
+
+  - uid: "concept:device"
+    pref_label: "device"
+    definition: "A physical object designed for a purpose"
+    status: "active"
+
+terms:
+  - concept_uid: "concept:device"
+    lang: "en"
+    label: "device"
+    is_preferred: true
