@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Environment
+.env
+
+# Node
+node_modules/
+dist/
+
+# Alembic cache
+backend/alembic/versions/__pycache__/
+
+# OS
+.DS_Store
