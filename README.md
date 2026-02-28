@@ -11,3 +11,10 @@ curl -X POST http://127.0.0.1:8000/documents/paste \\
   -H 'Content-Type: application/json' \\
   -d '{"text":"Hello world. Second sentence?"}'
 ```
+
+Translate with stub provider:
+```bash
+curl -X POST http://127.0.0.1:8000/translate/document/1 \\
+  -H 'Content-Type: application/json' \\
+  -d '{"provider":"stub"}'
+```

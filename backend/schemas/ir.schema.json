@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["sentence_id", "text", "entities", "relations"],
+  "properties": {
+    "sentence_id": {"type": "string", "minLength": 1},
+    "text": {"type": "string"},
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["span", "surface", "candidate_concepts", "chosen_uid", "needs_review"],
+        "properties": {
+          "span": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {"type": "integer", "minimum": 0}
+          },
+          "surface": {"type": "string"},
+          "candidate_concepts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["uid", "score"],
+              "properties": {
+                "uid": {"type": "string"},
+                "score": {"type": "number"}
+              },
+              "additionalProperties": true
+            }
+          },
+          "chosen_uid": {"type": "string"},
+          "needs_review": {"type": "boolean"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "relations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["subject_surface", "subject_uid", "relation_uid", "confidence", "needs_review"],
+        "properties": {
+          "subject_surface": {"type": "string"},
+          "subject_uid": {"type": "string"},
+          "relation_uid": {"type": "string"},
+          "object_surface": {"type": "string"},
+          "object_uid": {"type": "string"},
+          "object_literal": {"type": "string"},
+          "qualifiers": {"type": "object"},
+          "confidence": {"type": "number"},
+          "needs_review": {"type": "boolean"},
+          "notes": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "open_terms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "surface": {"type": "string"},
+          "suggested_parent": {"type": "string"},
+          "reason": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

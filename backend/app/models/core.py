@@ -83,6 +83,28 @@ class TranslationRun(Base):
     params_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[str] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+class SentenceIR(Base):
+    __tablename__ = "sentence_ir"
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
+    translation_run_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("translation_run.id", ondelete="CASCADE"),
+        index=True,
+    )
+    sentence_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("sentence.id", ondelete="CASCADE"),
+        index=True,
+    )
+    ir_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    is_valid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    errors_json: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[str] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_sentence_ir_run_sentence", "translation_run_id", "sentence_id", unique=True),
+    )
+
 class Expression(Base):
     __tablename__ = "expression"
     id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
