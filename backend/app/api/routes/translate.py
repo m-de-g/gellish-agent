@@ -137,7 +137,7 @@ def get_translation_run(run_id: int, db: Session = Depends(get_db)) -> Translati
     counts = db.execute(
         select(
             func.count(SentenceIR.id),
-            func.sum(case((SentenceIR.is_valid == True, 1), else_=0)),
+            func.sum(case((SentenceIR.is_valid.is_(True), 1), else_=0)),
         ).where(SentenceIR.translation_run_id == run_id)
     ).one()
 
