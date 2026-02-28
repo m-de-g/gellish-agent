@@ -108,6 +108,19 @@ class SentenceIR(Base):
 class Expression(Base):
     __tablename__ = "expression"
     id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
+    translation_run_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("translation_run.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sentence_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("sentence.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    relation_index: Mapped[int] = mapped_column(Integer, nullable=False)
     subject_uid: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     relation_uid: Mapped[str] = mapped_column(String(255), ForeignKey("relation_type.uid"), nullable=False, index=True)
     object_uid: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)  # concept UID
@@ -117,6 +130,16 @@ class Expression(Base):
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="proposed")  # proposed|accepted|rejected
     created_at: Mapped[str] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index(
+            "ix_expression_run_sentence_relation_idx",
+            "translation_run_id",
+            "sentence_id",
+            "relation_index",
+            unique=True,
+        ),
+    )
 
 class AdvisorCall(Base):
     __tablename__ = "advisor_call"

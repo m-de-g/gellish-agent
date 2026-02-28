@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import csv
+import io
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from ...db.session import get_db
 from ...ir_validation import validate_ir
-from ...models.core import Document, Expression, Sentence, SentenceIR, TranslationRun
+from ...models.core import Document, Expression, ReviewQueue, Sentence, SentenceIR, TranslationRun
 from ...providers import StubProvider
+from ...services.ir_renderer import render_ir_to_expressions
 
 router = APIRouter(tags=["translation"])
 
@@ -39,10 +42,91 @@ class TranslationRunOut(BaseModel):
     invalid_count: int
 
 
+class ExpressionOut(BaseModel):
+    id: int
+    subject_uid: str
+    relation_uid: str
+    object_uid: str | None
+    object_literal: str | None
+    confidence: float | None
+    status: str
+    qualifiers_json: dict[str, Any] | None
+    provenance_json: dict[str, Any] | None
+
+
 def _get_provider(name: str):
     if name == "stub":
         return StubProvider(), "stub"
     raise HTTPException(status_code=400, detail=f"Unknown provider: {name}")
+
+
+def _get_or_create_translation_run(
+    *,
+    db: Session,
+    document_id: int,
+    provider_name: str,
+    params_json: dict[str, Any] | None,
+) -> TranslationRun:
+    # Reuse matching runs so repeated translate requests are idempotent.
+    existing_runs = db.execute(
+        select(TranslationRun)
+        .where(
+            TranslationRun.document_id == document_id,
+            TranslationRun.llm_provider == provider_name,
+            TranslationRun.llm_model == provider_name,
+        )
+        .order_by(TranslationRun.id.desc())
+    ).scalars().all()
+
+    for run in existing_runs:
+        if (run.params_json or None) == (params_json or None):
+            return run
+
+    run = TranslationRun(
+        document_id=document_id,
+        llm_provider=provider_name,
+        llm_model=provider_name,
+        params_json=params_json,
+    )
+    db.add(run)
+    db.flush()
+    return run
+
+
+def _create_review_item_if_missing(
+    *,
+    db: Session,
+    item_type: str,
+    item_ref: str,
+    reason: str,
+) -> None:
+    existing = db.execute(
+        select(ReviewQueue.id).where(
+            ReviewQueue.item_type == item_type,
+            ReviewQueue.item_ref == item_ref,
+            ReviewQueue.status == "open",
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        db.add(ReviewQueue(item_type=item_type, item_ref=item_ref, reason=reason, status="open"))
+
+
+def _build_translate_summary(run_id: int, db: Session) -> TranslateSummary:
+    counts = db.execute(
+        select(
+            func.count(SentenceIR.id),
+            func.sum(case((SentenceIR.is_valid.is_(True), 1), else_=0)),
+        ).where(SentenceIR.translation_run_id == run_id)
+    ).one()
+    sentences_processed = int(counts[0] or 0)
+    valid_count = int(counts[1] or 0)
+    invalid_count = sentences_processed - valid_count
+    return TranslateSummary(
+        translation_run_id=run_id,
+        sentences_processed=sentences_processed,
+        valid_count=valid_count,
+        invalid_count=invalid_count,
+    )
 
 
 @router.post("/translate/document/{document_id}", response_model=TranslateSummary)
@@ -56,25 +140,29 @@ def translate_document(
         raise HTTPException(status_code=404, detail="Document not found")
 
     provider, provider_name = _get_provider(payload.provider)
-
-    run = TranslationRun(
+    params_json = {"max_sentences": payload.max_sentences} if payload.max_sentences else None
+    run = _get_or_create_translation_run(
+        db=db,
         document_id=document_id,
-        llm_provider=provider_name,
-        llm_model=provider_name,
-        params_json={"max_sentences": payload.max_sentences} if payload.max_sentences else None,
+        provider_name=provider_name,
+        params_json=params_json,
     )
-    db.add(run)
-    db.flush()
 
     query = select(Sentence).where(Sentence.document_id == document_id).order_by(Sentence.sentence_index)
     if payload.max_sentences:
         query = query.limit(payload.max_sentences)
     sentences = db.execute(query).scalars().all()
 
-    valid_count = 0
-    invalid_count = 0
-
     for sentence in sentences:
+        existing_sentence_ir = db.execute(
+            select(SentenceIR).where(
+                SentenceIR.translation_run_id == run.id,
+                SentenceIR.sentence_id == sentence.id,
+            )
+        ).scalar_one_or_none()
+        if existing_sentence_ir is not None:
+            continue
+
         context = {
             "sentence_id": f"doc{document_id}:s{sentence.sentence_index}",
             "document_id": document_id,
@@ -82,10 +170,6 @@ def translate_document(
         }
         ir = provider.generate_ir(sentence.text, context)
         is_valid, errors = validate_ir(ir)
-        if is_valid:
-            valid_count += 1
-        else:
-            invalid_count += 1
 
         db.add(
             SentenceIR(
@@ -97,35 +181,65 @@ def translate_document(
             )
         )
 
-        if is_valid:
-            for relation in ir.get("relations", []):
-                db.add(
-                    Expression(
-                        subject_uid=relation.get("subject_uid", "provisional:subject"),
-                        relation_uid=relation.get("relation_uid", "rel:unknown"),
-                        object_uid=relation.get("object_uid"),
-                        object_literal=relation.get("object_literal"),
-                        qualifiers_json=relation.get("qualifiers"),
-                        provenance_json={
-                            "document_id": document_id,
-                            "sentence_id": sentence.id,
-                            "sentence_index": sentence.sentence_index,
-                            "char_start": sentence.char_start,
-                            "char_end": sentence.char_end,
-                        },
-                        confidence=relation.get("confidence"),
-                        status="proposed",
-                    )
+        if not is_valid:
+            _create_review_item_if_missing(
+                db=db,
+                item_type="sentence_ir",
+                item_ref=f"{run.id}:{sentence.id}",
+                reason="SentenceIR validation failed",
+            )
+            continue
+
+        rendered_rows = render_ir_to_expressions(
+            ir,
+            provenance={
+                "document_id": document_id,
+                "sentence_id": sentence.id,
+                "translation_run_id": run.id,
+                "sentence_text": sentence.text,
+            },
+        )
+        existing_relation_indices = set(
+            db.execute(
+                select(Expression.relation_index).where(
+                    Expression.translation_run_id == run.id,
+                    Expression.sentence_id == sentence.id,
+                )
+            ).scalars()
+        )
+
+        for rendered in rendered_rows:
+            if rendered.relation_index in existing_relation_indices:
+                continue
+
+            db.add(
+                Expression(
+                    translation_run_id=rendered.translation_run_id,
+                    sentence_id=rendered.sentence_id,
+                    relation_index=rendered.relation_index,
+                    subject_uid=rendered.subject_uid,
+                    relation_uid=rendered.relation_uid,
+                    object_uid=rendered.object_uid,
+                    object_literal=rendered.object_literal,
+                    qualifiers_json=rendered.qualifiers_json,
+                    provenance_json=rendered.provenance_json,
+                    confidence=rendered.confidence,
+                    status=rendered.status,
+                )
+            )
+            existing_relation_indices.add(rendered.relation_index)
+
+            uids = [rendered.subject_uid, rendered.relation_uid, rendered.object_uid]
+            if any(uid is not None and uid.startswith("provisional:") for uid in uids):
+                _create_review_item_if_missing(
+                    db=db,
+                    item_type="expression",
+                    item_ref=f"{run.id}:{sentence.id}:{rendered.relation_index}",
+                    reason="Provisional UID requires review",
                 )
 
     db.commit()
-
-    return TranslateSummary(
-        translation_run_id=run.id,
-        sentences_processed=len(sentences),
-        valid_count=valid_count,
-        invalid_count=invalid_count,
-    )
+    return _build_translate_summary(run.id, db)
 
 
 @router.get("/translation-runs/{run_id}", response_model=TranslationRunOut)
@@ -156,3 +270,84 @@ def get_translation_run(run_id: int, db: Session = Depends(get_db)) -> Translati
         valid_count=valid_count,
         invalid_count=invalid_count,
     )
+
+
+@router.get("/translation-runs/{run_id}/expressions", response_model=list[ExpressionOut])
+def get_translation_run_expressions(run_id: int, db: Session = Depends(get_db)) -> list[ExpressionOut]:
+    run = db.execute(select(TranslationRun.id).where(TranslationRun.id == run_id)).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Translation run not found")
+
+    rows = (
+        db.execute(
+            select(Expression)
+            .where(Expression.translation_run_id == run_id)
+            .order_by(Expression.sentence_id, Expression.relation_index, Expression.id)
+        )
+        .scalars()
+        .all()
+    )
+
+    return [
+        ExpressionOut(
+            id=row.id,
+            subject_uid=row.subject_uid,
+            relation_uid=row.relation_uid,
+            object_uid=row.object_uid,
+            object_literal=row.object_literal,
+            confidence=row.confidence,
+            status=row.status,
+            qualifiers_json=row.qualifiers_json,
+            provenance_json=row.provenance_json,
+        )
+        for row in rows
+    ]
+
+
+@router.get("/translation-runs/{run_id}/export.csv")
+def export_translation_run_csv(run_id: int, db: Session = Depends(get_db)) -> Response:
+    run = db.execute(select(TranslationRun.id).where(TranslationRun.id == run_id)).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Translation run not found")
+
+    rows = (
+        db.execute(
+            select(Expression)
+            .where(Expression.translation_run_id == run_id)
+            .order_by(Expression.sentence_id, Expression.relation_index, Expression.id)
+        )
+        .scalars()
+        .all()
+    )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "expression_id",
+            "subject_uid",
+            "relation_uid",
+            "object_uid",
+            "object_literal",
+            "confidence",
+            "status",
+            "qualifiers_json",
+            "provenance_json",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row.id,
+                row.subject_uid,
+                row.relation_uid,
+                row.object_uid,
+                row.object_literal,
+                row.confidence,
+                row.status,
+                row.qualifiers_json,
+                row.provenance_json,
+            ]
+        )
+
+    return Response(content=output.getvalue(), media_type="text/csv")
