@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from ...db.session import get_db
 from ...ir_validation import validate_ir
-from ...models.core import Document, Expression, ReviewQueue, Sentence, SentenceIR, TranslationRun
+from ...models.core import Concept, Document, Expression, ReviewQueue, Sentence, SentenceIR, Term, TranslationRun
 from ...providers import StubProvider
 from ...services.ir_renderer import render_ir_to_expressions
 
@@ -109,6 +109,48 @@ def _create_review_item_if_missing(
     ).scalar_one_or_none()
     if existing is None:
         db.add(ReviewQueue(item_type=item_type, item_ref=item_ref, reason=reason, status="open"))
+
+
+def _norm_label(label: str) -> str:
+    return " ".join(label.strip().lower().split())
+
+
+def _ensure_provisional_concept(db: Session, uid: str) -> None:
+    if not uid.startswith("provisional:"):
+        return
+
+    concept = db.get(Concept, uid)
+    if concept is None:
+        label = uid.rsplit(":", maxsplit=1)[-1].replace("_", " ").replace("-", " ").strip() or uid
+        concept = Concept(uid=uid, pref_label=label, definition=None, status="provisional")
+        db.add(concept)
+        db.flush()
+
+    term_norm = _norm_label(concept.pref_label)
+    existing = db.execute(
+        select(Term.id).where(
+            Term.concept_uid == concept.uid,
+            Term.lang == "en",
+            Term.label_norm == term_norm,
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        db.add(
+            Term(
+                concept_uid=concept.uid,
+                lang="en",
+                label=concept.pref_label,
+                label_norm=term_norm,
+                is_preferred=True,
+            )
+        )
+
+    _create_review_item_if_missing(
+        db=db,
+        item_type="concept",
+        item_ref=concept.uid,
+        reason="Provisional concept requires review",
+    )
 
 
 def _build_translate_summary(run_id: int, db: Session) -> TranslateSummary:
@@ -229,8 +271,14 @@ def translate_document(
             )
             existing_relation_indices.add(rendered.relation_index)
 
-            uids = [rendered.subject_uid, rendered.relation_uid, rendered.object_uid]
-            if any(uid is not None and uid.startswith("provisional:") for uid in uids):
+            uids = [rendered.subject_uid, rendered.object_uid]
+            has_provisional = False
+            for uid in uids:
+                if uid is None or not uid.startswith("provisional:"):
+                    continue
+                has_provisional = True
+                _ensure_provisional_concept(db, uid)
+            if has_provisional:
                 _create_review_item_if_missing(
                     db=db,
                     item_type="expression",

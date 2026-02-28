@@ -1,10 +1,10 @@
-
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db import session as db_session
 from app.db.session import Base
+from app.cli.seed import seed_from_pack, load_yaml
 
 
 @pytest.fixture()
@@ -15,8 +15,27 @@ def db_engine(tmp_path):
         future=True,
         connect_args={"check_same_thread": False},
     )
+
     db_session.engine = engine
-    db_session.SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    db_session.SessionLocal = sessionmaker(
+        bind=engine, autoflush=False, autocommit=False, future=True
+    )
+
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
+
+    # ---- Seed starter pack into test DB ----
+    from pathlib import Path
+
+    ROOT = Path(__file__).resolve().parents[2]
+    pack = load_yaml(str(ROOT / "starter_packs" / "basic.yaml"))
+    
+    db = db_session.SessionLocal()
+    try:
+        seed_from_pack(db, pack)
+        db.commit()
+    finally:
+        db.close()
+    # -----------------------------------------
+
     return engine
