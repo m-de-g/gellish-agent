@@ -1,8 +1,11 @@
 from __future__ import annotations
 import os
+import sys
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from sqlalchemy import pool
 from alembic import context
 from dotenv import load_dotenv
 
@@ -13,8 +16,6 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Import your metadata
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from app.db.session import Base  # noqa
 import app.models.core  # noqa
 from app import models  # noqa  (ensures models are registered)

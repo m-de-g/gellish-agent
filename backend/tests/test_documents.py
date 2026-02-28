@@ -1,4 +1,3 @@
-import pytest
 from sqlalchemy import select
 
 from app.api.routes.documents import DocumentPasteIn, paste_document
