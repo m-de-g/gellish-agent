@@ -22,7 +22,22 @@ def _load_schema() -> dict[str, Any]:
 
 def validate_ir(ir_obj: dict[str, Any]) -> tuple[bool, list[str]]:
     if Draft7Validator is None:
-        return True, []
+        errors: list[str] = []
+        if not isinstance(ir_obj, dict):
+            return False, ["root: must be an object"]
+        required = ("sentence_id", "text", "entities", "relations")
+        for field in required:
+            if field not in ir_obj:
+                errors.append(f"{field}: is required")
+        if "sentence_id" in ir_obj and not isinstance(ir_obj["sentence_id"], str):
+            errors.append("sentence_id: must be a string")
+        if "text" in ir_obj and not isinstance(ir_obj["text"], str):
+            errors.append("text: must be a string")
+        if "entities" in ir_obj and not isinstance(ir_obj["entities"], list):
+            errors.append("entities: must be an array")
+        if "relations" in ir_obj and not isinstance(ir_obj["relations"], list):
+            errors.append("relations: must be an array")
+        return (len(errors) == 0, errors)
     schema = _load_schema()
     validator = Draft7Validator(schema)
     errors = [

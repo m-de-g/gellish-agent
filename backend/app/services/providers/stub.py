@@ -18,9 +18,7 @@ class StubProvider(IRProvider):
                 {
                     "span": [0, max(len(sentence_text), 1)],
                     "surface": sentence_text[:50] if sentence_text else "",
-                    "candidate_concepts": [
-                        {"uid": subject_uid, "score": 1.0}
-                    ],
+                    "candidate_concepts": [{"uid": subject_uid, "score": 1.0}],
                     "chosen_uid": subject_uid,
                     "needs_review": False,
                 }

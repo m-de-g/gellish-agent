@@ -12,8 +12,8 @@ from sqlalchemy.orm import Session
 from ...db.session import get_db
 from ...ir_validation import validate_ir
 from ...models.core import Concept, Document, Expression, ReviewQueue, Sentence, SentenceIR, Term, TranslationRun
-from ...providers import StubProvider
 from ...services.ir_renderer import render_ir_to_expressions
+from ...services.providers import get_provider
 
 router = APIRouter(tags=["translation"])
 
@@ -21,6 +21,13 @@ router = APIRouter(tags=["translation"])
 class TranslateRequest(BaseModel):
     provider: str = Field(..., min_length=1)
     max_sentences: int | None = Field(default=None, ge=1)
+    openai: OpenAITranslateOptions | None = None
+
+
+class OpenAITranslateOptions(BaseModel):
+    model: str | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    seed: int | None = None
 
 
 class TranslateSummary(BaseModel):
@@ -54,17 +61,12 @@ class ExpressionOut(BaseModel):
     provenance_json: dict[str, Any] | None
 
 
-def _get_provider(name: str):
-    if name == "stub":
-        return StubProvider(), "stub"
-    raise HTTPException(status_code=400, detail=f"Unknown provider: {name}")
-
-
 def _get_or_create_translation_run(
     *,
     db: Session,
     document_id: int,
     provider_name: str,
+    model_name: str,
     params_json: dict[str, Any] | None,
 ) -> TranslationRun:
     # Reuse matching runs so repeated translate requests are idempotent.
@@ -73,7 +75,7 @@ def _get_or_create_translation_run(
         .where(
             TranslationRun.document_id == document_id,
             TranslationRun.llm_provider == provider_name,
-            TranslationRun.llm_model == provider_name,
+            TranslationRun.llm_model == model_name,
         )
         .order_by(TranslationRun.id.desc())
     ).scalars().all()
@@ -85,7 +87,7 @@ def _get_or_create_translation_run(
     run = TranslationRun(
         document_id=document_id,
         llm_provider=provider_name,
-        llm_model=provider_name,
+        llm_model=model_name,
         params_json=params_json,
     )
     db.add(run)
@@ -181,12 +183,26 @@ def translate_document(
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    provider, provider_name = _get_provider(payload.provider)
-    params_json = {"max_sentences": payload.max_sentences} if payload.max_sentences else None
+    provider_options: dict[str, Any] = {}
+    if payload.provider == "openai":
+        provider_options = payload.openai.model_dump(exclude_none=True) if payload.openai else {}
+
+    try:
+        provider, provider_name, model_name = get_provider(payload.provider, provider_options)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    params_payload: dict[str, Any] = {}
+    if payload.max_sentences:
+        params_payload["max_sentences"] = payload.max_sentences
+    if provider_options:
+        params_payload[payload.provider] = provider_options
+    params_json = params_payload or None
     run = _get_or_create_translation_run(
         db=db,
         document_id=document_id,
         provider_name=provider_name,
+        model_name=model_name,
         params_json=params_json,
     )
 
@@ -210,8 +226,27 @@ def translate_document(
             "document_id": document_id,
             "sentence_index": sentence.sentence_index,
         }
-        ir = provider.generate_ir(sentence.text, context)
-        is_valid, errors = validate_ir(ir)
+        max_attempts = 1 if provider_name == "stub" else 3
+        ir: dict[str, Any] = {}
+        errors: list[str] = []
+        is_valid = False
+        for attempt in range(max_attempts):
+            attempt_context = dict(context)
+            attempt_context["retry_attempt"] = attempt
+            if errors:
+                attempt_context["validation_errors"] = errors
+
+            candidate_ir = provider.generate_ir(sentence.text, attempt_context)
+            if isinstance(candidate_ir, dict):
+                ir = candidate_ir
+                is_valid, errors = validate_ir(ir)
+            else:
+                ir = {}
+                is_valid = False
+                errors = [f"Provider returned non-object IR: {type(candidate_ir).__name__}"]
+
+            if is_valid:
+                break
 
         db.add(
             SentenceIR(
@@ -224,11 +259,12 @@ def translate_document(
         )
 
         if not is_valid:
+            first_error = errors[0] if errors else "unknown validation error"
             _create_review_item_if_missing(
                 db=db,
                 item_type="sentence_ir",
                 item_ref=f"{run.id}:{sentence.id}",
-                reason="SentenceIR validation failed",
+                reason=f"SentenceIR validation failed: {first_error}",
             )
             continue
 
