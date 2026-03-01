@@ -5,8 +5,10 @@ import io
 import time
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
+import zipfile
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
@@ -14,8 +16,27 @@ from sqlalchemy.orm import Session
 from .dictionary import PromoteConceptIn, promote_concept_internal
 from ...db.session import get_db
 from ...ir_validation import validate_ir
-from ...models.core import Concept, ConceptAlias, Document, Expression, Sentence, SentenceIR, Term, TranslationRun
+from ...models.core import (
+    Concept,
+    ConceptAlias,
+    Document,
+    ExportArtifact,
+    Expression,
+    Sentence,
+    SentenceIR,
+    Term,
+    TranslationRun,
+)
 from ...services.ir_renderer import render_ir_to_expressions
+from ...services.export_artifacts import (
+    FACTS_BUNDLE_KIND,
+    SOUFFLE_FORMAT,
+    artifact_dir_from_storage_path,
+    artifact_storage_path,
+    load_manifest,
+    upsert_artifact_manifest_metadata,
+    write_souffle_bundle,
+)
 from ...services.providers import ProviderError, ProviderResult, ProviderUsage, get_provider
 from ...services.reviews import enqueue_review_item
 from ...services.uid import canonical_concept_uid
@@ -96,6 +117,42 @@ class TranslationRunProvisionalsOut(BaseModel):
     run_id: int
     provisional_uids: list[str]
     counts: dict[str, int]
+
+
+class ExportArtifactOut(BaseModel):
+    id: int
+    translation_run_id: int
+    format: str
+    kind: str
+    storage_path: str
+    sha256: str | None
+    row_count: int | None
+    schema_version: str | None
+    created_at: Any
+    meta_json: dict[str, Any] | None
+
+
+class ExportArtifactCreateOut(BaseModel):
+    export_id: int
+    run_id: int
+    created_at: Any
+    row_count: int
+    download_url: str
+
+
+class ExportArtifactListItem(BaseModel):
+    export_id: int
+    run_id: int
+    format: str
+    kind: str
+    created_at: Any
+    row_count: int | None
+
+
+class ExportPreviewOut(BaseModel):
+    export_id: int
+    file: str
+    lines: list[str]
 
 
 class PromoteProvisionalsMappingItem(BaseModel):
@@ -266,6 +323,35 @@ def _build_translate_summary(
         next_sentence_index=next_sentence_index,
         is_complete=is_complete,
         aborted_reason=aborted_reason,
+    )
+
+
+def _get_run_or_404(run_id: int, db: Session) -> TranslationRun:
+    run = db.execute(select(TranslationRun).where(TranslationRun.id == run_id)).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Translation run not found")
+    return run
+
+
+def _get_export_or_404(export_id: int, db: Session) -> ExportArtifact:
+    artifact = db.execute(select(ExportArtifact).where(ExportArtifact.id == export_id)).scalar_one_or_none()
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Export artifact not found")
+    return artifact
+
+
+def _export_to_out(artifact: ExportArtifact) -> ExportArtifactOut:
+    return ExportArtifactOut(
+        id=artifact.id,
+        translation_run_id=artifact.translation_run_id,
+        format=artifact.format,
+        kind=artifact.kind,
+        storage_path=artifact.storage_path,
+        sha256=artifact.sha256,
+        row_count=artifact.row_count,
+        schema_version=artifact.schema_version,
+        created_at=artifact.created_at,
+        meta_json=artifact.meta_json,
     )
 
 
@@ -728,6 +814,174 @@ def get_translation_run_sentence_irs(run_id: int, db: Session = Depends(get_db))
         )
         for row in rows
     ]
+
+
+@router.post("/translation-runs/{run_id}/exports/souffle", response_model=ExportArtifactCreateOut)
+def create_translation_run_souffle_export(
+    run_id: int,
+    db: Session = Depends(get_db),
+) -> ExportArtifactCreateOut:
+    _get_run_or_404(run_id, db)
+
+    artifact = ExportArtifact(
+        translation_run_id=run_id,
+        format=SOUFFLE_FORMAT,
+        kind=FACTS_BUNDLE_KIND,
+        storage_path=f"exports/tmp-{uuid4()}",
+    )
+    db.add(artifact)
+    db.flush()
+
+    artifact.storage_path = artifact_storage_path(artifact.id)
+    db.flush()
+    db.refresh(artifact)
+
+    write_result = write_souffle_bundle(
+        db=db,
+        run_id=run_id,
+        export_id=artifact.id,
+        created_at=artifact.created_at,
+    )
+    upsert_artifact_manifest_metadata(artifact, write_result)
+    db.commit()
+    db.refresh(artifact)
+
+    return ExportArtifactCreateOut(
+        export_id=artifact.id,
+        run_id=run_id,
+        created_at=artifact.created_at,
+        row_count=int(artifact.row_count or 0),
+        download_url=f"/exports/{artifact.id}/download",
+    )
+
+
+@router.get("/translation-runs/{run_id}/exports", response_model=list[ExportArtifactListItem])
+def list_translation_run_exports(
+    run_id: int,
+    db: Session = Depends(get_db),
+) -> list[ExportArtifactListItem]:
+    _get_run_or_404(run_id, db)
+    rows = (
+        db.execute(
+            select(ExportArtifact)
+            .where(ExportArtifact.translation_run_id == run_id)
+            .order_by(ExportArtifact.created_at.desc(), ExportArtifact.id.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        ExportArtifactListItem(
+            export_id=row.id,
+            run_id=row.translation_run_id,
+            format=row.format,
+            kind=row.kind,
+            created_at=row.created_at,
+            row_count=row.row_count,
+        )
+        for row in rows
+    ]
+
+
+@router.get("/exports", response_model=list[ExportArtifactListItem])
+def list_exports(
+    format_: str | None = Query(default=None, alias="format"),
+    kind: str | None = Query(default=None),
+    run_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[ExportArtifactListItem]:
+    query = select(ExportArtifact)
+    if format_ is not None:
+        query = query.where(ExportArtifact.format == format_)
+    if kind is not None:
+        query = query.where(ExportArtifact.kind == kind)
+    if run_id is not None:
+        query = query.where(ExportArtifact.translation_run_id == run_id)
+    rows = (
+        db.execute(
+            query.order_by(ExportArtifact.created_at.desc(), ExportArtifact.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        ExportArtifactListItem(
+            export_id=row.id,
+            run_id=row.translation_run_id,
+            format=row.format,
+            kind=row.kind,
+            created_at=row.created_at,
+            row_count=row.row_count,
+        )
+        for row in rows
+    ]
+
+
+@router.get("/exports/{export_id}", response_model=ExportArtifactOut)
+def get_export_artifact(export_id: int, db: Session = Depends(get_db)) -> ExportArtifactOut:
+    artifact = _get_export_or_404(export_id, db)
+    manifest = load_manifest(artifact.storage_path)
+    if manifest is not None:
+        base_meta = artifact.meta_json or {}
+        artifact.meta_json = {
+            **base_meta,
+            "manifest": manifest,
+        }
+    return _export_to_out(artifact)
+
+
+@router.get("/exports/{export_id}/download")
+def download_export_artifact(export_id: int, db: Session = Depends(get_db)) -> Response:
+    artifact = _get_export_or_404(export_id, db)
+    artifact_dir = artifact_dir_from_storage_path(artifact.storage_path)
+    if not artifact_dir.exists():
+        raise HTTPException(status_code=404, detail="Artifact files not found")
+    required_files = ["triple.facts", "program.dl", "manifest.json", "README.txt"]
+    for filename in required_files:
+        if not (artifact_dir / filename).exists():
+            raise HTTPException(status_code=404, detail=f"Artifact file not found: {filename}")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for filename in required_files:
+            archive.write(artifact_dir / filename, arcname=filename)
+
+    filename = f"export_{export_id}_{artifact.format}.zip"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/exports/{export_id}/preview", response_model=ExportPreviewOut)
+def preview_export_artifact_file(
+    export_id: int,
+    file: str = Query(default="triple.facts"),
+    lines: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> ExportPreviewOut:
+    artifact = _get_export_or_404(export_id, db)
+    allowed_files = {"triple.facts", "program.dl", "manifest.json", "README.txt"}
+    if file not in allowed_files:
+        raise HTTPException(status_code=400, detail=f"Unsupported preview file: {file}")
+
+    preview_path = artifact_dir_from_storage_path(artifact.storage_path) / file
+    if not preview_path.exists():
+        raise HTTPException(status_code=404, detail="Artifact file not found")
+
+    collected: list[str] = []
+    with preview_path.open("r", encoding="utf-8") as handle:
+        for idx, line in enumerate(handle):
+            if idx >= lines:
+                break
+            collected.append(line.rstrip("\n"))
+
+    return ExportPreviewOut(export_id=export_id, file=file, lines=collected)
 
 
 @router.get("/translation-runs/{run_id}/export.csv")

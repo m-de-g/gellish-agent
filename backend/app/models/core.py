@@ -187,3 +187,22 @@ class ConceptAlias(Base):
     kind: Mapped[str] = mapped_column(String(32), nullable=False, default="concept")
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ExportArtifact(Base):
+    __tablename__ = "export_artifact"
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
+    translation_run_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("translation_run.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    format: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    storage_path: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    schema_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    meta_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
