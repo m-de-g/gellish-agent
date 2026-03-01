@@ -18,7 +18,7 @@ from app.api.routes.translate import (
 from app.db import session as db_session
 from app.main import create_app
 from app.models.core import ConceptAlias, Expression, ReviewQueue, SentenceIR, TranslationRun
-from app.services.providers import register_provider, reset_provider_registry
+from app.services.providers import ProviderError, register_provider, reset_provider_registry
 
 
 def test_translate_document_stub_persists_expressions_and_exports_csv(db_engine):
@@ -241,6 +241,156 @@ def test_translate_document_openai_maps_entity_relations_to_non_null_expression_
         }
     finally:
         reset_provider_registry()
+
+
+def test_translate_document_provider_invalid_ir_creates_sentence_review_and_invalid_count(db_engine):
+    class InvalidIRProvider:
+        def generate_ir(self, sentence_text: str, context: dict) -> dict:
+            return {"sentence_id": context["sentence_id"], "text": sentence_text}
+
+    register_provider("openai", lambda _: (InvalidIRProvider(), "fake-openai-model"))
+    try:
+        with db_session.SessionLocal() as db:
+            doc = paste_document(DocumentPasteIn(text="Alpha has value 1."), db)
+            summary = translate_document(doc.id, TranslateRequest(provider="openai"), db)
+            sentence_row = db.execute(
+                select(SentenceIR).where(SentenceIR.translation_run_id == summary.translation_run_id)
+            ).scalar_one()
+            review_row = db.execute(
+                select(ReviewQueue).where(
+                    ReviewQueue.item_type == "sentence_ir",
+                    ReviewQueue.item_ref == f"{summary.translation_run_id}:{sentence_row.sentence_id}",
+                )
+            ).scalar_one()
+
+        assert summary.valid_count == 0
+        assert summary.invalid_count == 1
+        assert sentence_row.is_valid is False
+        assert review_row.reason is not None
+    finally:
+        reset_provider_registry()
+
+
+def test_translate_document_provider_rate_limit_then_success_retries_and_counts(db_engine):
+    class RateLimitThenSuccessProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_ir(self, sentence_text: str, context: dict) -> dict:
+            self.calls += 1
+            if self.calls == 1:
+                raise ProviderError(kind="rate_limit", message="rate limit hit", status_code=429)
+            return {
+                "sentence_id": context["sentence_id"],
+                "text": sentence_text,
+                "entities": [],
+                "relations": [
+                    {
+                        "subject_surface": "Alpha",
+                        "subject_uid": "concept:alpha",
+                        "relation_uid": "rel:has_value",
+                        "object_literal": "1",
+                        "confidence": 0.8,
+                        "needs_review": False,
+                    }
+                ],
+                "open_terms": [],
+            }
+
+    provider = RateLimitThenSuccessProvider()
+    register_provider("openai", lambda _: (provider, "fake-openai-model"))
+    try:
+        with db_session.SessionLocal() as db:
+            doc = paste_document(DocumentPasteIn(text="Alpha has value 1."), db)
+            summary = translate_document(doc.id, TranslateRequest(provider="openai"), db)
+            run = db.execute(
+                select(TranslationRun).where(TranslationRun.id == summary.translation_run_id)
+            ).scalar_one()
+
+        assert provider.calls == 2
+        assert summary.valid_count == 1
+        assert summary.invalid_count == 0
+        assert run.retries_total == 1
+    finally:
+        reset_provider_registry()
+
+
+def test_translate_document_provider_quota_aborts_run(db_engine):
+    class QuotaProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_ir(self, sentence_text: str, context: dict) -> dict:
+            self.calls += 1
+            raise ProviderError(kind="quota", message="quota exceeded", status_code=402)
+
+    provider = QuotaProvider()
+    register_provider("openai", lambda _: (provider, "fake-openai-model"))
+    try:
+        with db_session.SessionLocal() as db:
+            doc = paste_document(DocumentPasteIn(text="A. B. C."), db)
+            summary = translate_document(doc.id, TranslateRequest(provider="openai"), db)
+            run = db.execute(
+                select(TranslationRun).where(TranslationRun.id == summary.translation_run_id)
+            ).scalar_one()
+            sentence_rows = db.execute(
+                select(SentenceIR).where(SentenceIR.translation_run_id == summary.translation_run_id)
+            ).scalars().all()
+
+        assert provider.calls == 1
+        assert summary.aborted_reason is not None
+        assert run.aborted_reason is not None
+        assert "quota" in run.aborted_reason
+        assert len(sentence_rows) == 1
+    finally:
+        reset_provider_registry()
+
+
+def test_translate_document_resumable_slice_advances_and_stays_idempotent(db_engine):
+    with db_session.SessionLocal() as db:
+        doc = paste_document(DocumentPasteIn(text="Alpha has value 1. Beta has value 2. Gamma has value 3."), db)
+
+    with db_session.SessionLocal() as db:
+        first = translate_document(
+            doc.id,
+            TranslateRequest(provider="stub", start_sentence_index=0, max_sentences=1),
+            db,
+        )
+        run = db.execute(select(TranslationRun).where(TranslationRun.id == first.translation_run_id)).scalar_one()
+        second = translate_document(
+            doc.id,
+            TranslateRequest(
+                provider="stub",
+                start_sentence_index=1,
+                max_sentences=1,
+                translation_run_id=run.id,
+            ),
+            db,
+        )
+        third = translate_document(
+            doc.id,
+            TranslateRequest(
+                provider="stub",
+                start_sentence_index=1,
+                max_sentences=1,
+                translation_run_id=run.id,
+            ),
+            db,
+        )
+        expression_count = int(
+            db.execute(
+                select(func.count(Expression.id)).where(Expression.translation_run_id == run.id)
+            ).scalar_one()
+            or 0
+        )
+
+    assert first.next_sentence_index == 1
+    assert first.is_complete is False
+    assert second.translation_run_id == first.translation_run_id
+    assert second.next_sentence_index == 2
+    assert second.is_complete is False
+    assert third.sentences_processed == second.sentences_processed
+    assert expression_count == 2
 
 
 def test_translation_run_batch_promote_provisionals_and_review_resolution(db_engine):

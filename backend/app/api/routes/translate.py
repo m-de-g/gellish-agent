@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import io
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -14,7 +16,7 @@ from ...db.session import get_db
 from ...ir_validation import validate_ir
 from ...models.core import Concept, ConceptAlias, Document, Expression, Sentence, SentenceIR, Term, TranslationRun
 from ...services.ir_renderer import render_ir_to_expressions
-from ...services.providers import get_provider
+from ...services.providers import ProviderError, ProviderResult, ProviderUsage, get_provider
 from ...services.reviews import enqueue_review_item
 from ...services.uid import canonical_concept_uid
 
@@ -23,7 +25,9 @@ router = APIRouter(tags=["translation"])
 
 class TranslateRequest(BaseModel):
     provider: str = Field(..., min_length=1)
+    start_sentence_index: int = Field(default=0, ge=0)
     max_sentences: int | None = Field(default=None, ge=1)
+    translation_run_id: int | None = Field(default=None, ge=1)
     openai: OpenAITranslateOptions | None = None
 
 
@@ -38,6 +42,9 @@ class TranslateSummary(BaseModel):
     sentences_processed: int
     valid_count: int
     invalid_count: int
+    next_sentence_index: int | None = None
+    is_complete: bool = False
+    aborted_reason: str | None = None
 
 
 class TranslationRunOut(BaseModel):
@@ -47,9 +54,20 @@ class TranslationRunOut(BaseModel):
     llm_model: str | None
     params_json: dict[str, Any] | None
     created_at: Any
+    started_at: Any | None
+    finished_at: Any | None
+    provider: str | None
+    model: str | None
+    total_sentences: int
+    processed_sentences: int
     sentences_processed: int
     valid_count: int
     invalid_count: int
+    retries_total: int
+    token_prompt_total: int | None
+    token_completion_total: int | None
+    token_total: int | None
+    aborted_reason: str | None
 
 
 class ExpressionOut(BaseModel):
@@ -120,17 +138,48 @@ def _get_or_create_translation_run(
 
     for run in existing_runs:
         if (run.params_json or None) == (params_json or None):
+            run.provider = provider_name
+            run.model = model_name
             return run
 
     run = TranslationRun(
         document_id=document_id,
         llm_provider=provider_name,
         llm_model=model_name,
+        provider=provider_name,
+        model=model_name,
         params_json=params_json,
     )
     db.add(run)
     db.flush()
     return run
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _retry_backoff_seconds(retry_count: int) -> float:
+    if retry_count <= 0:
+        return 0.0
+    if retry_count == 1:
+        return 0.5
+    return 1.5
+
+
+def _provider_error_to_errors_json(error: ProviderError) -> list[str]:
+    return [f"provider_error kind={error.kind} message={error.message}"]
+
+
+def _apply_usage_totals(run: TranslationRun, usage: ProviderUsage | None) -> None:
+    if usage is None:
+        return
+    if usage.prompt_tokens is not None:
+        run.token_prompt_total = int(run.token_prompt_total or 0) + int(usage.prompt_tokens)
+    if usage.completion_tokens is not None:
+        run.token_completion_total = int(run.token_completion_total or 0) + int(usage.completion_tokens)
+    if usage.total_tokens is not None:
+        run.token_total = int(run.token_total or 0) + int(usage.total_tokens)
 
 
 def _norm_label(label: str) -> str:
@@ -190,7 +239,13 @@ def _collect_run_provisionals(run_id: int, db: Session) -> tuple[list[str], dict
     return sorted(counts.keys()), counts
 
 
-def _build_translate_summary(run_id: int, db: Session) -> TranslateSummary:
+def _build_translate_summary(
+    run_id: int,
+    db: Session,
+    *,
+    next_sentence_index: int | None = None,
+    is_complete: bool = False,
+) -> TranslateSummary:
     counts = db.execute(
         select(
             func.count(SentenceIR.id),
@@ -200,11 +255,17 @@ def _build_translate_summary(run_id: int, db: Session) -> TranslateSummary:
     sentences_processed = int(counts[0] or 0)
     valid_count = int(counts[1] or 0)
     invalid_count = sentences_processed - valid_count
+    aborted_reason = db.execute(
+        select(TranslationRun.aborted_reason).where(TranslationRun.id == run_id)
+    ).scalar_one_or_none()
     return TranslateSummary(
         translation_run_id=run_id,
         sentences_processed=sentences_processed,
         valid_count=valid_count,
         invalid_count=invalid_count,
+        next_sentence_index=next_sentence_index,
+        is_complete=is_complete,
+        aborted_reason=aborted_reason,
     )
 
 
@@ -227,25 +288,60 @@ def translate_document(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    params_payload: dict[str, Any] = {}
+    params_payload: dict[str, Any] = {"start_sentence_index": payload.start_sentence_index}
     if payload.max_sentences:
         params_payload["max_sentences"] = payload.max_sentences
     if provider_options:
         params_payload[payload.provider] = provider_options
     params_json = params_payload or None
-    run = _get_or_create_translation_run(
-        db=db,
-        document_id=document_id,
-        provider_name=provider_name,
-        model_name=model_name,
-        params_json=params_json,
-    )
 
-    query = select(Sentence).where(Sentence.document_id == document_id).order_by(Sentence.sentence_index)
+    if payload.translation_run_id is not None:
+        run = db.execute(
+            select(TranslationRun).where(TranslationRun.id == payload.translation_run_id)
+        ).scalar_one_or_none()
+        if run is None:
+            raise HTTPException(status_code=404, detail="Translation run not found")
+        if run.document_id != document_id:
+            raise HTTPException(status_code=400, detail="translation_run_id does not match document")
+        if run.llm_provider and run.llm_provider != provider_name:
+            raise HTTPException(status_code=400, detail="translation_run_id provider mismatch")
+        run.llm_provider = provider_name
+        run.llm_model = model_name
+        run.provider = provider_name
+        run.model = model_name
+    else:
+        run = _get_or_create_translation_run(
+            db=db,
+            document_id=document_id,
+            provider_name=provider_name,
+            model_name=model_name,
+            params_json=params_json,
+        )
+
+    total_sentences = int(
+        db.execute(select(func.count(Sentence.id)).where(Sentence.document_id == document_id)).scalar_one()
+        or 0
+    )
+    run.total_sentences = total_sentences
+    if run.started_at is None:
+        run.started_at = _now_utc()
+    run.finished_at = None
+    run.aborted_reason = None
+
+    query = (
+        select(Sentence)
+        .where(
+            Sentence.document_id == document_id,
+            Sentence.sentence_index >= payload.start_sentence_index,
+        )
+        .order_by(Sentence.sentence_index)
+    )
     if payload.max_sentences:
         query = query.limit(payload.max_sentences)
     sentences = db.execute(query).scalars().all()
 
+    aborted_reason: str | None = None
+    abort_run = False
     for sentence in sentences:
         existing_sentence_ir = db.execute(
             select(SentenceIR).where(
@@ -262,23 +358,43 @@ def translate_document(
             "sentence_index": sentence.sentence_index,
         }
         max_attempts = 1 if provider_name == "stub" else 3
+        provider_error_retries = 0
         ir: dict[str, Any] = {}
         errors: list[str] = []
         is_valid = False
+        usage: ProviderUsage | None = None
+
         for attempt in range(max_attempts):
             attempt_context = dict(context)
             attempt_context["retry_attempt"] = attempt
             if errors:
                 attempt_context["validation_errors"] = errors
 
-            candidate_ir = provider.generate_ir(sentence.text, attempt_context)
-            if isinstance(candidate_ir, dict):
-                ir = candidate_ir
+            try:
+                candidate_ir = provider.generate_ir(sentence.text, attempt_context)
+            except ProviderError as error:
+                errors = _provider_error_to_errors_json(error)
+                is_valid = False
+                if error.kind in {"auth", "quota"}:
+                    aborted_reason = f"{error.kind}: {error.message}"
+                    abort_run = True
+                    break
+                if error.kind in {"rate_limit", "timeout", "server"} and provider_error_retries < 2:
+                    provider_error_retries += 1
+                    run.retries_total = int(run.retries_total or 0) + 1
+                    time.sleep(_retry_backoff_seconds(provider_error_retries))
+                    continue
+                break
+
+            result = candidate_ir if isinstance(candidate_ir, ProviderResult) else ProviderResult(ir=candidate_ir)
+            usage = result.usage
+            if isinstance(result.ir, dict):
+                ir = result.ir
                 is_valid, errors = validate_ir(ir)
             else:
                 ir = {}
                 is_valid = False
-                errors = [f"Provider returned non-object IR: {type(candidate_ir).__name__}"]
+                errors = [f"Provider returned non-object IR: {type(result.ir).__name__}"]
 
             if is_valid:
                 break
@@ -294,15 +410,27 @@ def translate_document(
         )
 
         if not is_valid:
-            first_error = errors[0] if errors else "unknown validation error"
-            enqueue_review_item(
-                db=db,
-                item_type="sentence_ir",
-                item_ref=f"{run.id}:{sentence.id}",
-                reason=f"SentenceIR validation failed: {first_error}",
-            )
+            if errors and errors[0].startswith("provider_error"):
+                reason = errors[0].replace("provider_error ", "Provider error ")
+                enqueue_review_item(
+                    db=db,
+                    item_type="sentence_ir",
+                    item_ref=f"{run.id}:{sentence.id}",
+                    reason=reason,
+                )
+            else:
+                first_error = errors[0] if errors else "unknown validation error"
+                enqueue_review_item(
+                    db=db,
+                    item_type="sentence_ir",
+                    item_ref=f"{run.id}:{sentence.id}",
+                    reason=f"SentenceIR validation failed: {first_error}",
+                )
+            if abort_run:
+                break
             continue
 
+        _apply_usage_totals(run, usage)
         rendered_rows = render_ir_to_expressions(
             ir,
             provenance={
@@ -357,8 +485,35 @@ def translate_document(
                     reason="Provisional UID requires review",
                 )
 
+    run.processed_sentences = int(
+        db.execute(
+            select(func.count(SentenceIR.id)).where(SentenceIR.translation_run_id == run.id)
+        ).scalar_one()
+        or 0
+    )
+    run.valid_count = int(
+        db.execute(
+            select(func.sum(case((SentenceIR.is_valid.is_(True), 1), else_=0))).where(
+                SentenceIR.translation_run_id == run.id
+            )
+        ).scalar_one()
+        or 0
+    )
+    run.invalid_count = int(run.processed_sentences - run.valid_count)
+    run.aborted_reason = aborted_reason
+    run.finished_at = _now_utc()
+
+    slice_end = payload.start_sentence_index + len(sentences)
+    next_sentence_index = None if abort_run else (slice_end if slice_end < total_sentences else None)
+    is_complete = (next_sentence_index is None) and (not abort_run)
+
     db.commit()
-    return _build_translate_summary(run.id, db)
+    return _build_translate_summary(
+        run.id,
+        db,
+        next_sentence_index=next_sentence_index,
+        is_complete=is_complete,
+    )
 
 
 @router.get("/translation-runs/{run_id}", response_model=TranslationRunOut)
@@ -385,9 +540,20 @@ def get_translation_run(run_id: int, db: Session = Depends(get_db)) -> Translati
         llm_model=run.llm_model,
         params_json=run.params_json,
         created_at=run.created_at,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+        provider=run.provider,
+        model=run.model,
+        total_sentences=int(run.total_sentences or 0),
+        processed_sentences=int(run.processed_sentences or 0),
         sentences_processed=sentences_processed,
         valid_count=valid_count,
         invalid_count=invalid_count,
+        retries_total=int(run.retries_total or 0),
+        token_prompt_total=run.token_prompt_total,
+        token_completion_total=run.token_completion_total,
+        token_total=run.token_total,
+        aborted_reason=run.aborted_reason,
     )
 
 
