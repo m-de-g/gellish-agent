@@ -1,17 +1,23 @@
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.routes.documents import DocumentPasteIn, paste_document
 from app.api.routes.translate import (
     OpenAITranslateOptions,
+    PromoteProvisionalsMappingItem,
     TranslateRequest,
+    TranslationRunPromoteProvisionalsIn,
     export_translation_run_csv,
+    get_translation_run_provisionals,
+    get_translation_run_sentence_irs,
     get_translation_run_expressions,
+    promote_translation_run_provisionals,
     translate_document,
 )
 from app.db import session as db_session
-from app.models.core import Expression, ReviewQueue, SentenceIR, TranslationRun
+from app.main import create_app
+from app.models.core import ConceptAlias, Expression, ReviewQueue, SentenceIR, TranslationRun
 from app.services.providers import register_provider, reset_provider_registry
 
 
@@ -84,7 +90,7 @@ def test_translate_document_openai_with_fake_provider(db_engine):
                         "subject_surface": "Alpha",
                         "subject_uid": "concept:alpha",
                         "relation_uid": "rel:has_value",
-                        "object_literal": "1",
+                        "object_uid": "concept:value_1",
                         "confidence": 0.9,
                         "needs_review": False,
                     }
@@ -181,6 +187,247 @@ def test_translate_document_openai_retry_exhausted_creates_review(db_engine):
         assert sentence_row.errors_json
         assert review_row.reason is not None
         assert "SentenceIR validation failed:" in review_row.reason
+    finally:
+        reset_provider_registry()
+
+
+def test_translate_document_openai_maps_entity_relations_to_non_null_expression_uids(db_engine):
+    class EntityGraphProvider:
+        def generate_ir(self, sentence_text: str, context: dict) -> dict:
+            return {
+                "sentence_id": context["sentence_id"],
+                "text": sentence_text,
+                "entities": [
+                    {"entity_id": "entity:toaster", "entity_type": "object", "confidence": 1.0},
+                    {"entity_id": "entity:lever", "entity_type": "object", "confidence": 1.0},
+                ],
+                "relations": [
+                    {
+                        "relation_uid": "rel:has_part",
+                        "source_entity_id": "entity:toaster",
+                        "target_entity_id": "entity:lever",
+                        "confidence": 1.0,
+                        "needs_review": False,
+                        "subject_surface": "toaster",
+                        "subject_uid": "provisional:toaster",
+                    }
+                ],
+            }
+
+    register_provider("openai", lambda _: (EntityGraphProvider(), "fake-openai-model"))
+    try:
+        with db_session.SessionLocal() as db:
+            doc = paste_document(DocumentPasteIn(text="A toaster has a lever."), db)
+            summary = translate_document(doc.id, TranslateRequest(provider="openai"), db)
+            expression = db.execute(
+                select(Expression).where(Expression.translation_run_id == summary.translation_run_id)
+            ).scalar_one()
+            concept_reviews = db.execute(
+                select(ReviewQueue).where(
+                    ReviewQueue.item_type == "concept",
+                    ReviewQueue.item_ref.in_(["provisional:toaster", "provisional:lever"]),
+                )
+            ).scalars().all()
+
+        assert summary.valid_count == 1
+        assert expression.subject_uid == "provisional:toaster"
+        assert expression.relation_uid == "rel:has_part"
+        assert expression.object_uid == "provisional:lever"
+        assert expression.object_uid is not None
+        assert expression.object_literal is None
+        assert {item.item_ref for item in concept_reviews} == {
+            "provisional:toaster",
+            "provisional:lever",
+        }
+    finally:
+        reset_provider_registry()
+
+
+def test_translation_run_batch_promote_provisionals_and_review_resolution(db_engine):
+    class EntityGraphProvider:
+        def generate_ir(self, sentence_text: str, context: dict) -> dict:
+            return {
+                "sentence_id": context["sentence_id"],
+                "text": sentence_text,
+                "entities": [
+                    {"entity_id": "entity:toaster", "entity_type": "object", "confidence": 1.0},
+                    {"entity_id": "entity:lever", "entity_type": "object", "confidence": 1.0},
+                ],
+                "relations": [
+                    {
+                        "relation_uid": "rel:has_part",
+                        "source_entity_id": "entity:toaster",
+                        "target_entity_id": "entity:lever",
+                        "confidence": 1.0,
+                        "needs_review": False,
+                        "subject_surface": "toaster",
+                        "subject_uid": "provisional:toaster",
+                    }
+                ],
+            }
+
+    register_provider("openai", lambda _: (EntityGraphProvider(), "fake-openai-model"))
+    try:
+        with db_session.SessionLocal() as db:
+            doc = paste_document(DocumentPasteIn(text="A toaster has a lever!"), db)
+            summary = translate_document(doc.id, TranslateRequest(provider="openai"), db)
+
+            provisionals = get_translation_run_provisionals(summary.translation_run_id, db)
+            assert set(provisionals.provisional_uids) == {"provisional:toaster", "provisional:lever"}
+            assert provisionals.counts["provisional:toaster"] == 1
+            assert provisionals.counts["provisional:lever"] == 1
+
+            result_1 = promote_translation_run_provisionals(
+                summary.translation_run_id,
+                TranslationRunPromoteProvisionalsIn(
+                    mapping={
+                        "provisional:toaster": PromoteProvisionalsMappingItem(
+                            new_uid="concept:toaster",
+                            pref_label="toaster",
+                            definition=None,
+                        ),
+                        "provisional:lever": PromoteProvisionalsMappingItem(
+                            new_uid="concept:lever",
+                            pref_label="lever",
+                        ),
+                    },
+                    auto_generate_missing=False,
+                ),
+                db,
+            )
+            assert result_1.promoted == {
+                "provisional:toaster": "concept:toaster",
+                "provisional:lever": "concept:lever",
+            }
+            assert result_1.skipped == []
+            assert result_1.expressions_updated == 2
+            assert result_1.review_items_resolved >= 2
+
+            rows_after = db.execute(
+                select(Expression).where(Expression.translation_run_id == summary.translation_run_id)
+            ).scalars().all()
+            assert rows_after
+            assert all(row.subject_uid != "provisional:toaster" for row in rows_after)
+            assert all(row.object_uid != "provisional:lever" for row in rows_after)
+            assert any(row.subject_uid == "concept:toaster" for row in rows_after)
+            assert any(row.object_uid == "concept:lever" for row in rows_after)
+
+            aliases = db.execute(
+                select(ConceptAlias).where(
+                    ConceptAlias.old_uid.in_(["provisional:toaster", "provisional:lever"])
+                )
+            ).scalars().all()
+            assert len(aliases) == 2
+            assert {row.old_uid for row in aliases} == {"provisional:toaster", "provisional:lever"}
+            assert {row.new_uid for row in aliases} == {"concept:toaster", "concept:lever"}
+
+            review_rows = db.execute(
+                select(ReviewQueue).where(
+                    ReviewQueue.item_type == "concept",
+                    ReviewQueue.item_ref.in_(["provisional:toaster", "provisional:lever"]),
+                )
+            ).scalars().all()
+            assert review_rows
+            assert all(row.status == "resolved" for row in review_rows)
+            assert all(row.resolution == "promoted" for row in review_rows)
+
+            alias_count_before = int(db.execute(select(func.count(ConceptAlias.id))).scalar_one())
+
+            result_2 = promote_translation_run_provisionals(
+                summary.translation_run_id,
+                TranslationRunPromoteProvisionalsIn(
+                    mapping={
+                        "provisional:toaster": PromoteProvisionalsMappingItem(
+                            new_uid="concept:toaster",
+                            pref_label="toaster",
+                            definition=None,
+                        ),
+                        "provisional:lever": PromoteProvisionalsMappingItem(
+                            new_uid="concept:lever",
+                            pref_label="lever",
+                        ),
+                    },
+                    auto_generate_missing=False,
+                ),
+                db,
+            )
+            assert result_2.promoted == {
+                "provisional:toaster": "concept:toaster",
+                "provisional:lever": "concept:lever",
+            }
+            assert result_2.skipped == []
+            assert result_2.expressions_updated == 0
+            assert result_2.review_items_resolved == 0
+
+            alias_count_after = int(db.execute(select(func.count(ConceptAlias.id))).scalar_one())
+            assert alias_count_after == alias_count_before
+    finally:
+        reset_provider_registry()
+
+
+def test_review_queue_dedup_and_sentence_ir_inspection_endpoint(db_engine):
+    class EntityGraphProvider:
+        def generate_ir(self, sentence_text: str, context: dict) -> dict:
+            return {
+                "sentence_id": context["sentence_id"],
+                "text": sentence_text,
+                "entities": [
+                    {"entity_id": "entity:toaster", "entity_type": "object", "confidence": 1.0},
+                    {"entity_id": "entity:lever", "entity_type": "object", "confidence": 1.0},
+                ],
+                "relations": [
+                    {
+                        "relation_uid": "rel:has_part",
+                        "source_entity_id": "entity:toaster",
+                        "target_entity_id": "entity:lever",
+                        "confidence": 1.0,
+                        "needs_review": False,
+                        "subject_surface": "toaster",
+                        "subject_uid": "provisional:toaster",
+                    }
+                ],
+            }
+
+    register_provider("openai", lambda _: (EntityGraphProvider(), "fake-openai-model"))
+    try:
+        with db_session.SessionLocal() as db:
+            doc = paste_document(DocumentPasteIn(text="A toaster has a lever."), db)
+            summary_1 = translate_document(doc.id, TranslateRequest(provider="openai"), db)
+            open_concept_reviews_1 = db.execute(
+                select(ReviewQueue).where(
+                    ReviewQueue.item_type == "concept",
+                    ReviewQueue.item_ref == "provisional:toaster",
+                    ReviewQueue.status == "open",
+                )
+            ).scalars().all()
+
+        with db_session.SessionLocal() as db:
+            summary_2 = translate_document(
+                doc.id,
+                TranslateRequest(provider="openai", max_sentences=1),
+                db,
+            )
+            open_concept_reviews_2 = db.execute(
+                select(ReviewQueue).where(
+                    ReviewQueue.item_type == "concept",
+                    ReviewQueue.item_ref == "provisional:toaster",
+                    ReviewQueue.status == "open",
+                )
+            ).scalars().all()
+
+        assert summary_1.translation_run_id != summary_2.translation_run_id
+        assert len(open_concept_reviews_1) == 1
+        assert len(open_concept_reviews_2) == 1
+
+        with db_session.SessionLocal() as db:
+            payload = get_translation_run_sentence_irs(summary_1.translation_run_id, db)
+
+        assert len(payload) == summary_1.sentences_processed == 1
+        assert payload[0].is_valid is True
+        assert payload[0].ir_json is not None
+
+        openapi = create_app().openapi()
+        assert "/translation-runs/{run_id}/sentence-irs" in openapi["paths"]
     finally:
         reset_provider_registry()
 

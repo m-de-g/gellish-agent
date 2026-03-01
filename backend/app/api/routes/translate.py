@@ -6,14 +6,17 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
+from .dictionary import PromoteConceptIn, promote_concept_internal
 from ...db.session import get_db
 from ...ir_validation import validate_ir
-from ...models.core import Concept, Document, Expression, ReviewQueue, Sentence, SentenceIR, Term, TranslationRun
+from ...models.core import Concept, ConceptAlias, Document, Expression, Sentence, SentenceIR, Term, TranslationRun
 from ...services.ir_renderer import render_ir_to_expressions
 from ...services.providers import get_provider
+from ...services.reviews import enqueue_review_item
+from ...services.uid import canonical_concept_uid
 
 router = APIRouter(tags=["translation"])
 
@@ -61,6 +64,41 @@ class ExpressionOut(BaseModel):
     provenance_json: dict[str, Any] | None
 
 
+class SentenceIROut(BaseModel):
+    id: int
+    translation_run_id: int
+    sentence_id: int
+    is_valid: bool
+    errors_json: list[str] | None
+    ir_json: dict[str, Any]
+    created_at: Any
+
+
+class TranslationRunProvisionalsOut(BaseModel):
+    run_id: int
+    provisional_uids: list[str]
+    counts: dict[str, int]
+
+
+class PromoteProvisionalsMappingItem(BaseModel):
+    new_uid: str | None = Field(default=None, min_length=1)
+    pref_label: str | None = None
+    definition: str | None = None
+
+
+class TranslationRunPromoteProvisionalsIn(BaseModel):
+    mapping: dict[str, PromoteProvisionalsMappingItem] = Field(default_factory=dict)
+    auto_generate_missing: bool = False
+
+
+class TranslationRunPromoteProvisionalsOut(BaseModel):
+    run_id: int
+    promoted: dict[str, str]
+    skipped: list[str]
+    expressions_updated: int
+    review_items_resolved: int
+
+
 def _get_or_create_translation_run(
     *,
     db: Session,
@@ -93,24 +131,6 @@ def _get_or_create_translation_run(
     db.add(run)
     db.flush()
     return run
-
-
-def _create_review_item_if_missing(
-    *,
-    db: Session,
-    item_type: str,
-    item_ref: str,
-    reason: str,
-) -> None:
-    existing = db.execute(
-        select(ReviewQueue.id).where(
-            ReviewQueue.item_type == item_type,
-            ReviewQueue.item_ref == item_ref,
-            ReviewQueue.status == "open",
-        )
-    ).scalar_one_or_none()
-    if existing is None:
-        db.add(ReviewQueue(item_type=item_type, item_ref=item_ref, reason=reason, status="open"))
 
 
 def _norm_label(label: str) -> str:
@@ -147,12 +167,27 @@ def _ensure_provisional_concept(db: Session, uid: str) -> None:
             )
         )
 
-    _create_review_item_if_missing(
+    enqueue_review_item(
         db=db,
         item_type="concept",
         item_ref=concept.uid,
         reason="Provisional concept requires review",
     )
+
+
+def _collect_run_provisionals(run_id: int, db: Session) -> tuple[list[str], dict[str, int]]:
+    rows = db.execute(
+        select(Expression.subject_uid, Expression.object_uid).where(Expression.translation_run_id == run_id)
+    ).all()
+
+    counts: dict[str, int] = {}
+    for subject_uid, object_uid in rows:
+        if subject_uid and subject_uid.startswith("provisional:"):
+            counts[subject_uid] = counts.get(subject_uid, 0) + 1
+        if object_uid and object_uid.startswith("provisional:"):
+            counts[object_uid] = counts.get(object_uid, 0) + 1
+
+    return sorted(counts.keys()), counts
 
 
 def _build_translate_summary(run_id: int, db: Session) -> TranslateSummary:
@@ -260,7 +295,7 @@ def translate_document(
 
         if not is_valid:
             first_error = errors[0] if errors else "unknown validation error"
-            _create_review_item_if_missing(
+            enqueue_review_item(
                 db=db,
                 item_type="sentence_ir",
                 item_ref=f"{run.id}:{sentence.id}",
@@ -315,7 +350,7 @@ def translate_document(
                 has_provisional = True
                 _ensure_provisional_concept(db, uid)
             if has_provisional:
-                _create_review_item_if_missing(
+                enqueue_review_item(
                     db=db,
                     item_type="expression",
                     item_ref=f"{run.id}:{sentence.id}:{rendered.relation_index}",
@@ -383,6 +418,147 @@ def get_translation_run_expressions(run_id: int, db: Session = Depends(get_db)) 
             status=row.status,
             qualifiers_json=row.qualifiers_json,
             provenance_json=row.provenance_json,
+        )
+        for row in rows
+    ]
+
+
+@router.get("/translation-runs/{run_id}/provisionals", response_model=TranslationRunProvisionalsOut)
+def get_translation_run_provisionals(run_id: int, db: Session = Depends(get_db)) -> TranslationRunProvisionalsOut:
+    run = db.execute(select(TranslationRun.id).where(TranslationRun.id == run_id)).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Translation run not found")
+
+    provisional_uids, counts = _collect_run_provisionals(run_id, db)
+    return TranslationRunProvisionalsOut(run_id=run_id, provisional_uids=provisional_uids, counts=counts)
+
+
+@router.post(
+    "/translation-runs/{run_id}/promote-provisionals",
+    response_model=TranslationRunPromoteProvisionalsOut,
+)
+def promote_translation_run_provisionals(
+    run_id: int,
+    payload: TranslationRunPromoteProvisionalsIn,
+    db: Session = Depends(get_db),
+) -> TranslationRunPromoteProvisionalsOut:
+    run = db.execute(select(TranslationRun.id).where(TranslationRun.id == run_id)).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Translation run not found")
+
+    provisional_uids, _ = _collect_run_provisionals(run_id, db)
+    provisional_uid_set = set(provisional_uids)
+    for mapped_uid in payload.mapping:
+        if not mapped_uid.startswith("provisional:") or mapped_uid in provisional_uid_set:
+            continue
+        alias_exists = db.execute(
+            select(ConceptAlias.id).where(ConceptAlias.old_uid == mapped_uid)
+        ).scalar_one_or_none()
+        if alias_exists is not None:
+            provisional_uid_set.add(mapped_uid)
+    provisional_uids = sorted(provisional_uid_set)
+    promoted: dict[str, str] = {}
+    skipped: list[str] = []
+    expressions_updated = 0
+    review_items_resolved = 0
+
+    try:
+        for provisional_uid in provisional_uids:
+            mapping_item = payload.mapping.get(provisional_uid)
+            if mapping_item is None and not payload.auto_generate_missing:
+                skipped.append(provisional_uid)
+                continue
+
+            existing_alias = db.execute(
+                select(ConceptAlias).where(ConceptAlias.old_uid == provisional_uid)
+            ).scalar_one_or_none()
+            if existing_alias is not None:
+                if (
+                    mapping_item is not None
+                    and mapping_item.new_uid is not None
+                    and mapping_item.new_uid != existing_alias.new_uid
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"{provisional_uid} already mapped to {existing_alias.new_uid}",
+                    )
+                promoted[provisional_uid] = existing_alias.new_uid
+                continue
+
+            run_matches = int(
+                db.execute(
+                    select(func.count(Expression.id)).where(
+                        Expression.translation_run_id == run_id,
+                        or_(Expression.subject_uid == provisional_uid, Expression.object_uid == provisional_uid),
+                    )
+                ).scalar_one()
+                or 0
+            )
+
+            source_label = provisional_uid.rsplit(":", maxsplit=1)[-1].replace("_", " ").replace("-", " ").strip()
+            preferred_label = (
+                mapping_item.pref_label
+                if mapping_item is not None and mapping_item.pref_label is not None
+                else source_label
+            )
+            definition = mapping_item.definition if mapping_item is not None else None
+            target_uid = (
+                mapping_item.new_uid
+                if mapping_item is not None and mapping_item.new_uid is not None
+                else canonical_concept_uid(preferred_label, definition)
+            )
+
+            result = promote_concept_internal(
+                provisional_uid,
+                PromoteConceptIn(new_uid=target_uid, pref_label=preferred_label, definition=definition),
+                db,
+            )
+            promoted[provisional_uid] = result.new_uid
+            expressions_updated += run_matches
+            review_items_resolved += result.review_items_resolved
+
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Batch promotion failed: {exc}") from exc
+
+    return TranslationRunPromoteProvisionalsOut(
+        run_id=run_id,
+        promoted=promoted,
+        skipped=skipped,
+        expressions_updated=expressions_updated,
+        review_items_resolved=review_items_resolved,
+    )
+
+
+@router.get("/translation-runs/{run_id}/sentence-irs", response_model=list[SentenceIROut])
+def get_translation_run_sentence_irs(run_id: int, db: Session = Depends(get_db)) -> list[SentenceIROut]:
+    run = db.execute(select(TranslationRun.id).where(TranslationRun.id == run_id)).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Translation run not found")
+
+    rows = (
+        db.execute(
+            select(SentenceIR)
+            .where(SentenceIR.translation_run_id == run_id)
+            .order_by(SentenceIR.sentence_id.asc(), SentenceIR.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+
+    return [
+        SentenceIROut(
+            id=row.id,
+            translation_run_id=row.translation_run_id,
+            sentence_id=row.sentence_id,
+            is_valid=row.is_valid,
+            errors_json=row.errors_json,
+            ir_json=row.ir_json,
+            created_at=row.created_at,
         )
         for row in rows
     ]

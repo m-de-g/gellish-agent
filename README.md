@@ -32,3 +32,21 @@ curl -X POST http://127.0.0.1:8000/translate/document/1 \\
     "max_sentences":5
   }'
 ```
+
+List provisional concept UIDs for a translation run:
+```bash
+curl -X GET http://127.0.0.1:8000/translation-runs/1/provisionals
+```
+
+Batch-promote provisionals for a translation run:
+```bash
+curl -X POST http://127.0.0.1:8000/translation-runs/1/promote-provisionals \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+    "mapping": {
+      "provisional:toaster": {"new_uid":"concept:toaster","pref_label":"toaster","definition":null},
+      "provisional:lever": {"new_uid":"concept:lever","pref_label":"lever"}
+    },
+    "auto_generate_missing": false
+  }'
+```

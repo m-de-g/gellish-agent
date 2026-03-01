@@ -20,6 +20,7 @@ from ...models.core import (
     SentenceIR,
     Term,
 )
+from ...services.reviews import enqueue_review_item
 from ...services.uid import canonical_concept_uid
 
 router = APIRouter(prefix="/dictionary", tags=["dictionary"])
@@ -113,6 +114,131 @@ class PromoteConceptOut(BaseModel):
     new_uid: str
     expressions_updated: int
     review_items_resolved: int
+
+
+def promote_concept_internal(uid: str, payload: PromoteConceptIn, db: Session) -> PromoteConceptOut:
+    old_concept = db.get(Concept, uid)
+    if old_concept is None:
+        raise HTTPException(status_code=404, detail="Concept not found")
+    if not uid.startswith("provisional:"):
+        raise HTTPException(status_code=400, detail="Only provisional concepts can be promoted")
+
+    alias = db.execute(select(ConceptAlias).where(ConceptAlias.old_uid == uid)).scalar_one_or_none()
+    if alias is not None:
+        target_uid = alias.new_uid
+        if payload.new_uid is not None and payload.new_uid != target_uid:
+            raise HTTPException(status_code=409, detail="Provisional UID already mapped to another canonical UID")
+    else:
+        label_for_uid = payload.pref_label or old_concept.pref_label
+        definition_for_uid = payload.definition if payload.definition is not None else old_concept.definition
+        target_uid = payload.new_uid or canonical_concept_uid(label_for_uid, definition_for_uid)
+
+    refs = db.execute(
+        select(Expression.translation_run_id, Expression.sentence_id, Expression.relation_index).where(
+            or_(Expression.subject_uid == uid, Expression.object_uid == uid)
+        )
+    ).all()
+    expression_review_refs = {f"{run}:{sentence}:{idx}" for run, sentence, idx in refs}
+
+    expressions_updated = 0
+    review_items_resolved = 0
+    now = datetime.now(timezone.utc)
+
+    canonical = db.get(Concept, target_uid)
+    if canonical is None:
+        canonical = Concept(
+            uid=target_uid,
+            pref_label=payload.pref_label or old_concept.pref_label,
+            definition=payload.definition if payload.definition is not None else old_concept.definition,
+            status="active",
+        )
+        db.add(canonical)
+        db.flush()
+    else:
+        if payload.pref_label is not None:
+            canonical.pref_label = payload.pref_label
+        if payload.definition is not None:
+            canonical.definition = payload.definition
+        if canonical.status != "active":
+            canonical.status = "active"
+
+    canonical_pref_norm = _norm_label(canonical.pref_label)
+    canonical_pref_term = db.execute(
+        select(Term.id).where(
+            Term.concept_uid == canonical.uid,
+            Term.lang == "en",
+            Term.label_norm == canonical_pref_norm,
+        )
+    ).scalar_one_or_none()
+    if canonical_pref_term is None:
+        db.add(
+            Term(
+                concept_uid=canonical.uid,
+                lang="en",
+                label=canonical.pref_label,
+                label_norm=canonical_pref_norm,
+                is_preferred=True,
+            )
+        )
+
+    update_result = db.execute(
+        update(Expression)
+        .where(or_(Expression.subject_uid == uid, Expression.object_uid == uid))
+        .values(
+            subject_uid=case((Expression.subject_uid == uid, target_uid), else_=Expression.subject_uid),
+            object_uid=case((Expression.object_uid == uid, target_uid), else_=Expression.object_uid),
+        )
+    )
+    expressions_updated = int(update_result.rowcount or 0)
+
+    ir_rows = db.execute(
+        select(SentenceIR).where(cast(SentenceIR.ir_json, Text).like(f"%{uid}%"))
+    ).scalars().all()
+    for row in ir_rows:
+        replaced, changed = _replace_uid_in_json(row.ir_json, uid, target_uid)
+        if changed:
+            row.ir_json = replaced
+
+    old_concept.status = "deprecated"
+
+    if alias is None:
+        db.add(
+            ConceptAlias(
+                old_uid=uid,
+                new_uid=target_uid,
+                kind="concept",
+                notes="created by promotion",
+            )
+        )
+
+    review_filters = [
+        ReviewQueue.item_ref == uid,
+        ReviewQueue.item_ref.like(f"%{uid}%"),
+    ]
+    if expression_review_refs:
+        review_filters.append(ReviewQueue.item_ref.in_(expression_review_refs))
+
+    review_rows = db.execute(
+        select(ReviewQueue).where(
+            ReviewQueue.status == "open",
+            or_(*review_filters),
+        )
+    ).scalars().all()
+
+    for item in review_rows:
+        item.status = "resolved"
+        item.resolution = "promoted"
+        item.notes = f"Provisional {uid} promoted to {target_uid}"
+        item.resolved_at = now
+        item.updated_at = now
+    review_items_resolved = len(review_rows)
+
+    return PromoteConceptOut(
+        old_uid=uid,
+        new_uid=target_uid,
+        expressions_updated=expressions_updated,
+        review_items_resolved=review_items_resolved,
+    )
 
 
 @router.get("/terms", response_model=list[TermSearchItem])
@@ -310,22 +436,12 @@ def create_provisional_concept(
                 )
             )
 
-    open_review = db.execute(
-        select(ReviewQueue.id).where(
-            ReviewQueue.item_type == "concept",
-            ReviewQueue.item_ref == uid,
-            ReviewQueue.status == "open",
-        )
-    ).scalar_one_or_none()
-    if open_review is None:
-        db.add(
-            ReviewQueue(
-                item_type="concept",
-                item_ref=uid,
-                reason="Provisional concept requires review",
-                status="open",
-            )
-        )
+    enqueue_review_item(
+        db,
+        item_type="concept",
+        item_ref=uid,
+        reason="Provisional concept requires review",
+    )
 
     db.commit()
     return get_concept(uid, db)
@@ -333,131 +449,10 @@ def create_provisional_concept(
 
 @router.post("/concepts/{uid}/promote", response_model=PromoteConceptOut)
 def promote_concept(uid: str, payload: PromoteConceptIn, db: Session = Depends(get_db)) -> PromoteConceptOut:
-    old_concept = db.get(Concept, uid)
-    if old_concept is None:
-        raise HTTPException(status_code=404, detail="Concept not found")
-    if not uid.startswith("provisional:"):
-        raise HTTPException(status_code=400, detail="Only provisional concepts can be promoted")
-
-    alias = db.execute(select(ConceptAlias).where(ConceptAlias.old_uid == uid)).scalar_one_or_none()
-    if alias is not None:
-        target_uid = alias.new_uid
-        if payload.new_uid is not None and payload.new_uid != target_uid:
-            raise HTTPException(status_code=409, detail="Provisional UID already mapped to another canonical UID")
-    else:
-        label_for_uid = payload.pref_label or old_concept.pref_label
-        definition_for_uid = payload.definition if payload.definition is not None else old_concept.definition
-        target_uid = payload.new_uid or canonical_concept_uid(label_for_uid, definition_for_uid)
-
-    refs = db.execute(
-        select(Expression.translation_run_id, Expression.sentence_id, Expression.relation_index).where(
-            or_(Expression.subject_uid == uid, Expression.object_uid == uid)
-        )
-    ).all()
-    expression_review_refs = {f"{run}:{sentence}:{idx}" for run, sentence, idx in refs}
-
-    expressions_updated = 0
-    review_items_resolved = 0
-    now = datetime.now(timezone.utc)
-
     try:
-        canonical = db.get(Concept, target_uid)
-        if canonical is None:
-            canonical = Concept(
-                uid=target_uid,
-                pref_label=payload.pref_label or old_concept.pref_label,
-                definition=payload.definition if payload.definition is not None else old_concept.definition,
-                status="active",
-            )
-            db.add(canonical)
-            db.flush()
-        else:
-            if payload.pref_label is not None:
-                canonical.pref_label = payload.pref_label
-            if payload.definition is not None:
-                canonical.definition = payload.definition
-            if canonical.status != "active":
-                canonical.status = "active"
-
-        canonical_pref_norm = _norm_label(canonical.pref_label)
-        canonical_pref_term = db.execute(
-            select(Term.id).where(
-                Term.concept_uid == canonical.uid,
-                Term.lang == "en",
-                Term.label_norm == canonical_pref_norm,
-            )
-        ).scalar_one_or_none()
-        if canonical_pref_term is None:
-            db.add(
-                Term(
-                    concept_uid=canonical.uid,
-                    lang="en",
-                    label=canonical.pref_label,
-                    label_norm=canonical_pref_norm,
-                    is_preferred=True,
-                )
-            )
-
-        update_result = db.execute(
-            update(Expression)
-            .where(or_(Expression.subject_uid == uid, Expression.object_uid == uid))
-            .values(
-                subject_uid=case((Expression.subject_uid == uid, target_uid), else_=Expression.subject_uid),
-                object_uid=case((Expression.object_uid == uid, target_uid), else_=Expression.object_uid),
-            )
-        )
-        expressions_updated = int(update_result.rowcount or 0)
-
-        ir_rows = db.execute(
-            select(SentenceIR).where(cast(SentenceIR.ir_json, Text).like(f"%{uid}%"))
-        ).scalars().all()
-        for row in ir_rows:
-            replaced, changed = _replace_uid_in_json(row.ir_json, uid, target_uid)
-            if changed:
-                row.ir_json = replaced
-
-        old_concept.status = "deprecated"
-
-        if alias is None:
-            db.add(
-                ConceptAlias(
-                    old_uid=uid,
-                    new_uid=target_uid,
-                    kind="concept",
-                    notes="created by promotion",
-                )
-            )
-
-        review_filters = [
-            ReviewQueue.item_ref == uid,
-            ReviewQueue.item_ref.like(f"%{uid}%"),
-        ]
-        if expression_review_refs:
-            review_filters.append(ReviewQueue.item_ref.in_(expression_review_refs))
-
-        review_rows = db.execute(
-            select(ReviewQueue).where(
-                ReviewQueue.status == "open",
-                or_(*review_filters),
-            )
-        ).scalars().all()
-
-        for item in review_rows:
-            item.status = "resolved"
-            item.resolution = "promoted"
-            item.notes = f"Provisional {uid} promoted to {target_uid}"
-            item.resolved_at = now
-            item.updated_at = now
-        review_items_resolved = len(review_rows)
-
+        result = promote_concept_internal(uid, payload, db)
         db.commit()
+        return result
     except Exception:
         db.rollback()
         raise
-
-    return PromoteConceptOut(
-        old_uid=uid,
-        new_uid=target_uid,
-        expressions_updated=expressions_updated,
-        review_items_resolved=review_items_resolved,
-    )
