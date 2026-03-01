@@ -68,3 +68,13 @@ curl -X POST http://127.0.0.1:8000/translation-runs/1/promote-provisionals \\
     "auto_generate_missing": false
   }'
 ```
+
+## Frontend (Milestone 8.1 UI)
+1. From repo root, set frontend API URL (optional; defaults to `http://localhost:8000`):
+   - `cp frontend/.env.local.example frontend/.env.local`
+   - Edit `frontend/.env.local` if your backend is not on `http://localhost:8000`
+2. Start backend on port 8000.
+3. Start frontend:
+   - `npm -C frontend install`
+   - `npm -C frontend run dev`
+4. Open `http://localhost:5173`.
