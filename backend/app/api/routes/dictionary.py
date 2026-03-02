@@ -89,6 +89,13 @@ class ConceptAliasOut(BaseModel):
     created_at: Any
 
 
+class ConceptSearchItem(BaseModel):
+    uid: str
+    pref_label: str
+    definition: str | None
+    status: str
+
+
 class RelationTypeItem(BaseModel):
     uid: str
     pref_label: str
@@ -243,12 +250,12 @@ def promote_concept_internal(uid: str, payload: PromoteConceptIn, db: Session) -
 
 @router.get("/terms", response_model=list[TermSearchItem])
 def search_terms(
-    q: str = Query(..., min_length=1),
+    q: str | None = Query(default=None),
     lang: str = Query("en", min_length=1),
     limit: int = Query(20, ge=1, le=200),
     db: Session = Depends(get_db),
 ) -> list[TermSearchItem]:
-    q_norm = _norm_label(q)
+    q_norm = _norm_label(q or "")
     contains_pattern = f"%{q_norm}%"
     prefix_pattern = f"{q_norm}%"
 
@@ -259,19 +266,22 @@ def search_terms(
         else_=3,
     )
 
-    rows = db.execute(
+    query = (
         select(Term, Concept.pref_label)
         .join(Concept, Concept.uid == Term.concept_uid)
-        .where(
-            Term.lang == lang,
+        .where(Term.lang == lang)
+    )
+    if q_norm:
+        query = query.where(
             or_(
                 Term.label_norm == q_norm,
                 Term.label_norm.like(prefix_pattern),
                 Term.label_norm.like(contains_pattern),
-            ),
+            )
         )
-        .order_by(rank, Term.is_preferred.desc(), Term.label.asc(), Term.id.asc())
-        .limit(limit)
+
+    rows = db.execute(
+        query.order_by(rank, Term.is_preferred.desc(), Term.label.asc(), Term.id.asc()).limit(limit)
     ).all()
 
     return [
@@ -299,6 +309,81 @@ def get_alias(old_uid: str, db: Session = Depends(get_db)) -> ConceptAliasOut:
         notes=alias.notes,
         created_at=alias.created_at,
     )
+
+
+@router.get("/aliases", response_model=list[ConceptAliasOut])
+def search_aliases(
+    q: str | None = Query(default=None),
+    limit: int = Query(20, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> list[ConceptAliasOut]:
+    query = select(ConceptAlias)
+    q_norm = _norm_label(q or "")
+    if q_norm:
+        pattern = f"%{q_norm}%"
+        query = query.where(
+            or_(
+                cast(ConceptAlias.old_uid, Text).like(pattern),
+                cast(ConceptAlias.new_uid, Text).like(pattern),
+            )
+        )
+
+    rows = (
+        db.execute(query.order_by(ConceptAlias.created_at.desc(), ConceptAlias.id.desc()).limit(limit))
+        .scalars()
+        .all()
+    )
+    return [
+        ConceptAliasOut(
+            old_uid=row.old_uid,
+            new_uid=row.new_uid,
+            kind=row.kind,
+            notes=row.notes,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+@router.get("/concepts", response_model=list[ConceptSearchItem])
+def search_concepts(
+    q: str | None = Query(default=None),
+    limit: int = Query(20, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> list[ConceptSearchItem]:
+    q_norm = _norm_label(q or "")
+    contains_pattern = f"%{q_norm}%"
+    prefix_pattern = f"{q_norm}%"
+
+    rank = case(
+        (cast(Concept.pref_label, Text) == q_norm, 0),
+        (cast(Concept.pref_label, Text).like(prefix_pattern), 1),
+        (cast(Concept.pref_label, Text).like(contains_pattern), 2),
+        else_=3,
+    )
+
+    query = select(Concept)
+    if q_norm:
+        query = query.where(
+            or_(
+                cast(Concept.pref_label, Text).like(contains_pattern),
+                cast(Concept.uid, Text).like(contains_pattern),
+            )
+        )
+    rows = (
+        db.execute(query.order_by(rank, Concept.pref_label.asc(), Concept.uid.asc()).limit(limit))
+        .scalars()
+        .all()
+    )
+    return [
+        ConceptSearchItem(
+            uid=row.uid,
+            pref_label=row.pref_label,
+            definition=row.definition,
+            status=row.status,
+        )
+        for row in rows
+    ]
 
 
 @router.get("/concepts/{uid}", response_model=ConceptOut)
@@ -334,11 +419,11 @@ def get_concept(uid: str, db: Session = Depends(get_db)) -> ConceptOut:
 
 @router.get("/relations", response_model=list[RelationTypeItem])
 def search_relation_types(
-    q: str = Query(..., min_length=1),
+    q: str | None = Query(default=None),
     limit: int = Query(20, ge=1, le=200),
     db: Session = Depends(get_db),
 ) -> list[RelationTypeItem]:
-    q_norm = _norm_label(q)
+    q_norm = _norm_label(q or "")
     contains_pattern = f"%{q_norm}%"
     prefix_pattern = f"{q_norm}%"
 
@@ -349,17 +434,20 @@ def search_relation_types(
         else_=3,
     )
 
-    rows = db.execute(
-        select(RelationType)
-        .where(
+    query = select(RelationType)
+    if q_norm:
+        query = query.where(
             or_(
                 RelationType.pref_label.like(contains_pattern),
                 RelationType.uid.like(contains_pattern),
             )
         )
-        .order_by(rank, RelationType.pref_label.asc(), RelationType.uid.asc())
-        .limit(limit)
-    ).scalars().all()
+
+    rows = (
+        db.execute(query.order_by(rank, RelationType.pref_label.asc(), RelationType.uid.asc()).limit(limit))
+        .scalars()
+        .all()
+    )
 
     return [
         RelationTypeItem(

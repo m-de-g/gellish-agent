@@ -91,6 +91,17 @@ class TranslationRunOut(BaseModel):
     aborted_reason: str | None
 
 
+class TranslationRunListItem(BaseModel):
+    run_id: int
+    document_id: int
+    provider: str | None
+    created_at: Any
+    processed_sentences: int
+    valid_count: int
+    invalid_count: int
+    aborted_reason: str | None
+
+
 class ExpressionOut(BaseModel):
     id: int
     subject_uid: str
@@ -641,6 +652,50 @@ def get_translation_run(run_id: int, db: Session = Depends(get_db)) -> Translati
         token_total=run.token_total,
         aborted_reason=run.aborted_reason,
     )
+
+
+@router.get("/translation-runs", response_model=list[TranslationRunListItem])
+def list_translation_runs(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    document_id: int | None = Query(default=None, ge=1),
+    provider: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> list[TranslationRunListItem]:
+    query = select(TranslationRun)
+    if document_id is not None:
+        query = query.where(TranslationRun.document_id == document_id)
+    if provider is not None and provider.strip():
+        query = query.where(
+            or_(
+                TranslationRun.provider == provider,
+                TranslationRun.llm_provider == provider,
+            )
+        )
+
+    rows = (
+        db.execute(
+            query.order_by(TranslationRun.created_at.desc(), TranslationRun.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+
+    return [
+        TranslationRunListItem(
+            run_id=row.id,
+            document_id=row.document_id,
+            provider=row.provider or row.llm_provider,
+            created_at=row.created_at,
+            processed_sentences=int(row.processed_sentences or 0),
+            valid_count=int(row.valid_count or 0),
+            invalid_count=int(row.invalid_count or 0),
+            aborted_reason=row.aborted_reason,
+        )
+        for row in rows
+    ]
 
 
 @router.get("/translation-runs/{run_id}/expressions", response_model=list[ExpressionOut])

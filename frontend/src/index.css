@@ -45,6 +45,7 @@ a {
 
 nav {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.75rem;
 }
 
@@ -89,6 +90,11 @@ button {
   width: fit-content;
 }
 
+.button-active {
+  border: 1px solid #0b57d0;
+  background: #e8f0fe;
+}
+
 .table-wrap {
   overflow-x: auto;
 }
@@ -111,6 +117,10 @@ td {
   margin-top: 0.75rem;
   padding: 0.75rem;
   border: 1px solid #ddd;
+}
+
+ul {
+  padding-left: 1.1rem;
 }
 
 .json-box {

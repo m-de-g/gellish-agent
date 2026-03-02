@@ -35,6 +35,13 @@ class DocumentOut(BaseModel):
     created_at: Any
 
 
+class DocumentListItem(BaseModel):
+    id: int
+    source: str | None
+    mime_type: str | None
+    created_at: Any
+
+
 class SentenceOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -65,6 +72,28 @@ def paste_document(payload: DocumentPasteIn, db: Session = Depends(get_db)) -> I
         metadata=payload.metadata,
     )
     return IngestResult(id=doc.id, existing=existing)
+
+
+@router.get("", response_model=list[DocumentListItem])
+def list_documents(
+    limit: int = 50,
+    db: Session = Depends(get_db),
+) -> list[DocumentListItem]:
+    safe_limit = max(1, min(limit, 200))
+    rows = (
+        db.execute(select(Document).order_by(Document.created_at.desc(), Document.id.desc()).limit(safe_limit))
+        .scalars()
+        .all()
+    )
+    return [
+        DocumentListItem(
+            id=row.id,
+            source=row.source,
+            mime_type=row.mime_type,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
 
 
 @router.post("/upload", response_model=IngestResult)
